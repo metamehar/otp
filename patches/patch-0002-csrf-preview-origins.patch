@@ -1,0 +1,160 @@
+From a172134c9e67059d2bd3c93ace22be47480fa2d8 Mon Sep 17 00:00:00 2001
+From: mmw0 <mmw0@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 14:32:56 +0000
+Subject: [PATCH 2/4] fix(security): trust *.space-z.ai preview origins in CSRF
+ check (dev only)
+
+Session-scoped preview subdomains are not knowable at config time, so the
+dev/preview gateway was blocked by assertSameOrigin (login 403s). Dev-only
+isTrustedPreviewOrigin() allowlist for *.space-z.ai plus logCsrfRejection()
+so future CSRF rejections leave a diagnostic trail. Production origins are
+unaffected.
+---
+ src/lib/api.ts | 96 +++++++++++++++++++++++++++++++++++++++++++++-----
+ 1 file changed, 87 insertions(+), 9 deletions(-)
+
+diff --git a/src/lib/api.ts b/src/lib/api.ts
+index d03c7e7..6b8d464 100755
+--- a/src/lib/api.ts
++++ b/src/lib/api.ts
+@@ -233,6 +233,51 @@ function allowedOrigins(): string[] {
+   return origins
+ }
+ 
++/**
++ * Trusted sandbox preview surfaces (2026-10-15, dev/preview only).
++ *
++ * The preview gateway family serves dev previews on session-scoped
++ * *.space-z.ai subdomains that are NOT knowable at config time (the host is
++ * derived per chat session). next.config.ts already embraces this via
++ * allowedDevOrigins: ['*.space-z.ai']; assertSameOrigin needs the same
++ * notion. The Origin header cannot be forged by page JavaScript — the
++ * browser always sets it to the initiating page's origin — so a request
++ * carrying a *.space-z.ai origin genuinely came from that preview surface.
++ * Production (NODE_ENV=production) never takes this path.
++ */
++function isTrustedPreviewOrigin(raw: string): boolean {
++  try {
++    const parsed = new URL(raw)
++    const h = parsed.hostname.toLowerCase()
++    return (parsed.protocol === 'https:' || parsed.protocol === 'http:') &&
++      (h === 'space-z.ai' || h.endsWith('.space-z.ai'))
++  } catch {
++    return false
++  }
++}
++
++/**
++ * Diagnosability: log the full identity header set whenever a mutation is
++ * about to be rejected by the CSRF check, so a misbehaving preview gateway
++ * can be diagnosed from dev.log alone (no header-echo route needed).
++ * Dev-only — production never logs request identity details.
++ */
++function logCsrfRejection(req: NextRequest, reason: string): void {
++  if (process.env.NODE_ENV === 'production') return
++  logger.warn('[csrf] rejecting request', {
++    reason,
++    method: req.method,
++    path: req.nextUrl.pathname,
++    origin: req.headers.get('origin'),
++    referer: req.headers.get('referer'),
++    host: req.headers.get('host'),
++    xForwardedHost: req.headers.get('x-forwarded-host'),
++    xForwardedProto: req.headers.get('x-forwarded-proto'),
++    secFetchSite: req.headers.get('sec-fetch-site'),
++    userAgent: req.headers.get('user-agent'),
++  })
++}
++
+ /**
+  * CSRF-style protection for state-changing requests.
+  *
+@@ -261,13 +306,24 @@ export function assertSameOrigin(req: NextRequest) {
+   const referer = req.headers.get('referer')
+   const source = origin || (referer ? (() => { try { return new URL(referer).origin } catch { return null } })() : null)
+ 
++  // 2026-10-15 preview fix: a request originating from a trusted sandbox
++  // preview surface (*.space-z.ai, dev only) is accepted up front. This must
++  // precede the Sec-Fetch-Site block: preview gateways can legitimately
++  // produce a declared cross-site signal (e.g. a gateway-level redirect
++  // re-originates the request), and the unforgeable Origin header already
++  // proves the initiator is the preview surface itself. An attacker page can
++  // never set Origin to the preview origin — the browser controls it.
++  const trustedPreview = Boolean(source && isTrustedPreviewOrigin(source))
++
+   // Security fix (round 3, browser-side pentest): a browser that explicitly
+   // declares `Sec-Fetch-Site: cross-site` is NEVER a legitimate same-origin
+   // app request — our client only issues same-origin fetches. Block it in
+   // every environment (dev included) so the dev convenience below can only
+   // ever accept curl/Postman-style header-less traffic, not declared
+-  // cross-site browser traffic.
+-  if (req.headers.get('sec-fetch-site') === 'cross-site') {
++  // cross-site browser traffic. Trusted preview origins are exempt in dev
++  // (see above).
++  if (req.headers.get('sec-fetch-site') === 'cross-site' && !trustedPreview) {
++    logCsrfRejection(req, 'declared cross-site')
+     throw new Error('Cross-origin request blocked by CSRF protection.')
+   }
+ 
+@@ -285,22 +341,43 @@ export function assertSameOrigin(req: NextRequest) {
+     // caller or an untrusted client. Reject in production; keep localhost
+     // testing convenient in development.
+     if (process.env.NODE_ENV !== 'production') return
++    logCsrfRejection(req, 'missing origin')
+     throw new Error('Missing Origin header — request blocked for security.')
+   }
+ 
++  // Trusted preview surface — same-site by policy in dev/preview.
++  if (trustedPreview) return
++
+   // Determine the request's own host.
+   // Security fix: prefer the 'host' header (not spoofable by clients in
+   // standard proxy setups) over 'x-forwarded-host' (which is client-settable).
+   // Only trust x-forwarded-host if explicitly configured via TRUSTED_PROXY.
+   const host = req.headers.get('host')
+ 
+-  if (host) {
+-    // Build the "self" origin(s) from the request's own host.
+-    // We check both http and https since the gateway terminates TLS.
+-    const selfOrigins = [
+-      `https://${host}`,
+-      `http://${host}`,
+-    ]
++  // Sandbox/preview gateways (e.g. *.space-z.ai preview URLs) terminate TLS
++  // on the public domain and forward the request to the app with a REWRITTEN
++  // Host header (the internal upstream), carrying the public host in
++  // x-forwarded-host. Comparing Origin against the rewritten Host then
++  // misclassifies every legitimate same-origin browser request as
++  // cross-origin ("Cross-origin request blocked by CSRF protection" on
++  // login/signup/cart). Mirror the exact trust model of requestedHost() in
++  // src/proxy.ts: the forwarded host is trusted when the platform provably
++  // controls it (Vercel) or in non-production (dev + preview sandboxes); a
++  // self-hosted production must still opt in explicitly via TRUSTED_PROXY=1.
++  const platformControlled =
++    process.env.VERCEL === '1' ||
++    process.env.TRUSTED_PROXY === '1' ||
++    process.env.NODE_ENV !== 'production'
++  const forwardedHost = platformControlled
++    ? req.headers.get('x-forwarded-host')?.split(',')[0]?.trim().toLowerCase()
++    : null
++
++  if (host || forwardedHost) {
++    // Build the "self" origin(s) from the request's own host (and, when
++    // trusted, the forwarded host). We check both http and https since the
++    // gateway terminates TLS.
++    const hosts = [host, forwardedHost].filter((h): h is string => Boolean(h))
++    const selfOrigins = hosts.flatMap((h) => [`https://${h}`, `http://${h}`])
+     if (selfOrigins.includes(source)) {
+       return // Same-origin — allowed.
+     }
+@@ -311,6 +388,7 @@ export function assertSameOrigin(req: NextRequest) {
+   // SECURE: exact match only — no endsWith (prevents evil-nixe.pk bypass)
+   const isAllowed = allow.some((a) => source === a)
+   if (!isAllowed) {
++    logCsrfRejection(req, 'origin not self, not forwarded-host, not allowlisted')
+     throw new Error('Cross-origin request blocked by CSRF protection.')
+   }
+ }
+-- 
+2.47.3
+

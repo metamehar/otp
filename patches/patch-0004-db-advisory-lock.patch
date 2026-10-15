@@ -1,0 +1,40 @@
+From 5927d296c42e08ed4a9ade8632016b25151bac0b Mon Sep 17 00:00:00 2001
+From: mmw0 <mmw0@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 14:33:03 +0000
+Subject: [PATCH 4/4] fix(db): advisory-lock void column broke withKeyLock on
+ Postgres
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+pg_advisory_xact_lock() returns void; Prisma $queryRaw cannot deserialize
+a void column ('Failed to deserialize column of type void'), which 500'd
+every withKeyLock caller on Postgres — login lockout accounting, OTP
+issuance caps and bait-row lockouts. Switch to $executeRaw, which runs
+the statement and skips result-column deserialization entirely.
+---
+ src/lib/db.ts | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/src/lib/db.ts b/src/lib/db.ts
+index 1fcb9eb..3782600 100755
+--- a/src/lib/db.ts
++++ b/src/lib/db.ts
+@@ -115,7 +115,13 @@ export async function withKeyLock<T>(
+ ): Promise<T> {
+   if (isPostgres) {
+     return db.$transaction(async (tx) => {
+-      await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${key})::bigint)`
++      // 2026-10-15 Supabase migration fix: $queryRaw FAILS on Postgres here —
++      // pg_advisory_xact_lock() returns `void`, and Prisma's $queryRaw result
++      // deserializer cannot read a void column ("Failed to deserialize column
++      // of type 'void'"), which 500'd every withKeyLock caller on Postgres
++      // (login lockout accounting, OTP issuance caps, bait-row lockouts).
++      // $executeRaw runs the statement and skips result-column deserialization.
++      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${key})::bigint)`
+       return fn(tx)
+     })
+   }
+-- 
+2.47.3
+

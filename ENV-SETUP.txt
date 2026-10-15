@@ -1,0 +1,21 @@
+# NIXE Resend OTP — Environment Setup
+# Add these to .env (and mirror the keys into .env.example for documentation)
+
+RESEND_API_KEY="re_xxxxxxxxxxxxxxxxxxxx"
+# resend.com → API Keys → Create API Key (full access sending key)
+
+RESEND_FROM="NIXE <onboarding@resend.dev>"
+# Sandbox sender: ONLY delivers to your own Resend account email.
+# For real users, verify your domain at resend.com → Domains, then use:
+# RESEND_FROM="NIXE <noreply@yourdomain.com>"
+
+RESEND_REPLY_TO=""
+# Optional: reply-to address for outgoing mail.
+
+# ------------------------------------------------------------------
+# DELETE these legacy Gmail-SMTP/nodemailer variables everywhere
+# (.env, .env.example, hosting provider settings):
+# EMAIL_USER  EMAIL_PASS  EMAIL_FROM  EMAIL_FROM_NAME
+# SMTP_HOST   SMTP_PORT   SMTP_SECURE  SMTP_REQUIRE_TLS
+# ------------------------------------------------------------------
+# Also remove from package.json: "nodemailer", "@types/nodemailer"

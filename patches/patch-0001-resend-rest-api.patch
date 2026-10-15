@@ -1,0 +1,325 @@
+From 01187d9bff1e6795435eb5ad55fd2bad9de0ccd5 Mon Sep 17 00:00:00 2001
+From: mmw0 <mmw0@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 14:32:48 +0000
+Subject: [PATCH 1/4] feat(email): deliver all OTP mail via Resend REST API
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Replace the legacy Gmail-SMTP OTP transport with Resend (resend.com):
+sendOtpEmail() and sendAlreadyRegisteredEmail() now go exclusively through
+the new fetch-based Resend client (src/lib/resend.ts) — no SDK dependency.
+Configured via RESEND_API_KEY + RESEND_FROM (verified domain otp.nixe.pk).
+---
+ src/lib/email.ts  |  99 +++++++++++++++++-----------------
+ src/lib/resend.ts | 133 ++++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 182 insertions(+), 50 deletions(-)
+ create mode 100644 src/lib/resend.ts
+
+diff --git a/src/lib/email.ts b/src/lib/email.ts
+index 445ca7f..854abbb 100755
+--- a/src/lib/email.ts
++++ b/src/lib/email.ts
+@@ -7,15 +7,22 @@ import type { Transporter, SendMailOptions } from 'nodemailer'
+ import fs from 'fs'
+ import path from 'path'
+ import { BASE_URL } from '@/lib/site'
++import { sendViaResend, isResendConfigured } from '@/lib/resend'
+ import type { ValidatedSellerApplication } from '@/lib/seller-verification'
+ 
+ /**
+- * Email Service — sends real OTP verification emails using Gmail SMTP.
++ * Email Service.
+  *
+- * COMPLETELY FREE (no external service signup needed beyond a Gmail account).
+- * Gmail allows 500 emails/day for free.
++ * 2026-10-15 OTP-over-Resend migration — the OTP sending mechanism now runs
++ * EXCLUSIVELY through Resend (https://resend.com, REST API):
++ *   - sendOtpEmail()          → Resend (was Gmail SMTP)
++ *   - sendAlreadyRegisteredEmail() → Resend (was Gmail SMTP)
++ *   - isEmailConfigured       → true iff RESEND_API_KEY is set
++ * The Gmail SMTP / nodemailer transporter below remains ONLY for the non-OTP
++ * transactional mailers (order confirmation, contact form, seller
++ * verification, job applications).
+  *
+- * SETUP:
++ * LEGACY non-OTP SMTP SETUP (unchanged):
+  * 1. https://myaccount.google.com/security → Enable 2-Step Verification
+  * 2. "App passwords" → Generate a new app password for "Mail"
+  * 3. Add to .env: EMAIL_USER=your@gmail.com  EMAIL_PASS=your-16-char-password
+@@ -95,8 +102,16 @@ function getTransporter(): Transporter | null {
+   return transporter
+ }
+ 
+-/** Check if email service is configured */
+-export const isEmailConfigured = Boolean(EMAIL_USER && EMAIL_PASS)
++/**
++ * Whether the OTP email path is operational.
++ *
++ * 2026-10-15: OTP mail is delivered ONLY via Resend, so this is now keyed to
++ * RESEND_API_KEY (was: Gmail EMAIL_USER+EMAIL_PASS). All OTP call sites
++ * (auth/otp route, newsletter subscribe/unsubscribe) gate on this flag.
++ * The non-OTP mailers keep using the legacy SMTP transporter and do NOT
++ * consult this flag.
++ */
++export const isEmailConfigured = isResendConfigured
+ 
+ /** Read the logo file as a Buffer for inline embedding.
+  *  Uses the DARK logo (white text) — visible on dark email header backgrounds.
+@@ -120,9 +135,10 @@ function getLogoBuffer(): Buffer | null {
+ 
+ /** Send an OTP verification email */
+ export async function sendOtpEmail(to: string, code: string, type: 'signup' | 'reset' | 'login' | 'unlock' | 'unsubscribe' | 'subscribe'): Promise<boolean> {
+-  const transport = getTransporter()
+-  if (!transport) {
+-    throw new Error('Email service not configured. Add EMAIL_USER and EMAIL_PASS to .env')
++  // 2026-10-15 OTP-over-Resend migration: OTP mail is delivered ONLY via
++  // Resend. The legacy Gmail transporter is no longer consulted here.
++  if (!isResendConfigured) {
++    throw new Error('Email service not configured. Add RESEND_API_KEY to .env')
+   }
+ 
+   const subject = type === 'reset'
+@@ -213,37 +229,29 @@ export async function sendOtpEmail(to: string, code: string, type: 'signup' | 'r
+ 
+   const text = `NIXE — ${subject}\n\nYour verification code is: ${code}\n\nUse this code to ${purpose}. This code expires in 10 minutes.\n\nIf you didn't request this, you can safely ignore this email.\n\n© ${new Date().getFullYear()} NIXE, Inc.\n${BASE_URL}`
+ 
+-  // Build email options with inline logo attachment.
++  // Build the Resend payload.
+   // fix-critical-security #16: sanitize ALL header-bound values to prevent
+   // email header injection (CRLF injection → Bcc/Subject spoofing).
+-  //   - `from` is built from env vars (operator-controlled) but sanitized
+-  //     for defense-in-depth in case the env vars contain stray CRLF.
+   //   - `to` is the user's email — the caller runs validateEmail, but we
+   //     sanitize again in case the value slipped through with embedded CRLF.
+   //   - `subject` is hardcoded (no user input) but sanitized for symmetry.
+-  const safeFromName = sanitizeHeader(FROM_NAME)
+-  const safeFromEmail = sanitizeHeader(FROM_EMAIL)
++  //   - `from` is operator-controlled via RESEND_FROM and sanitized inside
++  //     sendViaResend itself.
+   const safeTo = sanitizeHeader(to)
+   const safeSubject = sanitizeHeader(subject)
+-  const mailOptions: SendMailOptions = {
+-    from: `"${safeFromName}" <${safeFromEmail}>`,
++
++  // 2026-10-15: delivered via the Resend REST API. The attachments entry
++  // carries content_id: 'nixelogo', giving the exact same inline-CID
++  // behaviour nodemailer's `cid:` option provided for the logo.
++  await sendViaResend({
+     to: safeTo,
+     subject: safeSubject,
+-    text,
+     html,
+-  }
+-
+-  // Attach the logo as an inline image (CID reference)
+-  if (logoBuffer) {
+-    mailOptions.attachments = [{
+-      filename: 'nixe-logo.png',
+-      content: logoBuffer,
+-      cid: 'nixelogo',
+-      encoding: 'base64',
+-    }]
+-  }
+-
+-  await transport.sendMail(mailOptions)
++    text,
++    attachments: logoBuffer
++      ? [{ filename: 'nixe-logo.png', content: logoBuffer.toString('base64'), content_id: 'nixelogo' }]
++      : undefined,
++  })
+ 
+   return true
+ }
+@@ -260,10 +268,10 @@ export async function sendOtpEmail(to: string, code: string, type: 'signup' | 'r
+  * suppression-vs-send timing side channel.
+  */
+ export async function sendAlreadyRegisteredEmail(to: string): Promise<boolean> {
+-  const transport = getTransporter()
+-  if (!transport) {
+-    throw new Error('Email service not configured. Add EMAIL_USER and EMAIL_PASS to .env')
+-  }
++  // 2026-10-15 OTP-over-Resend migration: courtesy notice goes via Resend.
++  // When Resend is not configured this is a silent no-op — the notice is
++  // best-effort by design and must never break the signup flow.
++  if (!isResendConfigured) return false
+ 
+   const subject = 'You already have a NIXE account'
+   const logoBuffer = getLogoBuffer()
+@@ -326,27 +334,18 @@ export async function sendAlreadyRegisteredEmail(to: string): Promise<boolean> {
+ 
+   const text = `NIXE — ${subject}\n\nSomeone just tried to create a new NIXE account with this email address, but an account already exists, so no signup code was sent.\n\nIf this was you, sign in instead: ${BASE_URL}/login\nForgot your password? Reset it here: ${BASE_URL}/forgot-password\n\nIf you didn't request this, you can safely ignore this email.\n\n© ${new Date().getFullYear()} NIXE, Inc.\n${BASE_URL}`
+ 
+-  const safeFromName = sanitizeHeader(FROM_NAME)
+-  const safeFromEmail = sanitizeHeader(FROM_EMAIL)
+   const safeTo = sanitizeHeader(to)
+   const safeSubject = sanitizeHeader(subject)
+-  const mailOptions: SendMailOptions = {
+-    from: `"${safeFromName}" <${safeFromEmail}>`,
++
++  await sendViaResend({
+     to: safeTo,
+     subject: safeSubject,
+-    text,
+     html,
+-  }
+-  if (logoBuffer) {
+-    mailOptions.attachments = [{
+-      filename: 'nixe-logo.png',
+-      content: logoBuffer,
+-      cid: 'nixelogo',
+-      encoding: 'base64',
+-    }]
+-  }
+-
+-  await transport.sendMail(mailOptions)
++    text,
++    attachments: logoBuffer
++      ? [{ filename: 'nixe-logo.png', content: logoBuffer.toString('base64'), content_id: 'nixelogo' }]
++      : undefined,
++  })
+ 
+   return true
+ }
+diff --git a/src/lib/resend.ts b/src/lib/resend.ts
+new file mode 100644
+index 0000000..6092b88
+--- /dev/null
++++ b/src/lib/resend.ts
+@@ -0,0 +1,133 @@
++import { logger } from './logger'
++
++/**
++ * Resend email transport — REPLACES the Gmail SMTP path for ALL OTP mail.
++ *
++ * Scope (2026-10-15 OTP-over-Resend migration):
++ *   - src/lib/email.ts sendOtpEmail() and sendAlreadyRegisteredEmail() now
++ *     deliver through this module (Resend REST API, https://resend.com).
++ *   - The nodemailer/Gmail transporter in email.ts remains ONLY for the
++ *     non-OTP transactional mailers (order confirmation, contact form,
++ *     seller verification, job applications).
++ *
++ * SETUP (.env):
++ *   RESEND_API_KEY="re_..."        # resend.com → API Keys → Create API Key
++ *   RESEND_FROM="NIXE <onboarding@resend.dev>"
++ *                                  # shared TEST sender — delivers ONLY to
++ *                                  # the email that owns the Resend account
++ *   RESEND_FROM="NIXE <no-reply@nixe.pk>"
++ *                                  # production sender — requires verifying
++ *                                  # the domain in Resend → Domains (DNS)
++ *   RESEND_REPLY_TO="support@nixe.pk"  # optional
++ *
++ * API reference: POST https://api.resend.com/emails
++ *   { from, to[], subject, html, text, reply_to?, attachments? }
++ *   attachments: [{ filename, content: <base64>, content_id }] — content_id
++ *   enables inline CID references (the NIXE logo uses cid:nixelogo).
++ */
++
++const RESEND_API_KEY = process.env.RESEND_API_KEY || ''
++const RESEND_FROM = process.env.RESEND_FROM || 'NIXE <onboarding@resend.dev>'
++const RESEND_REPLY_TO = process.env.RESEND_REPLY_TO || ''
++
++/** True when the OTP email path is operational (Resend key present). */
++export const isResendConfigured = Boolean(RESEND_API_KEY)
++
++/** CRLF strip — same defense-in-depth as email.ts sanitizeHeader. */
++function safeHeader(value: string): string {
++  return String(value).replace(/[\r\n]/g, '').trim()
++}
++
++export interface ResendAttachment {
++  filename: string
++  /** Base64-encoded file content. */
++  content: string
++  /** Inline CID for <img src="cid:..."> references. */
++  content_id?: string
++}
++
++export interface ResendSendOptions {
++  to: string
++  subject: string
++  html: string
++  text: string
++  attachments?: ResendAttachment[]
++}
++
++/**
++ * Send one email through the Resend REST API. Throws on any failure —
++ * callers (auth/otp route) invalidate the issued OTP when this throws so a
++ * code that was never delivered can never be used.
++ */
++export async function sendViaResend(opts: ResendSendOptions): Promise<{ id: string }> {
++  if (!RESEND_API_KEY) {
++    throw new Error('Email service not configured. Add RESEND_API_KEY to .env')
++  }
++
++  const payload: Record<string, unknown> = {
++    from: safeHeader(RESEND_FROM),
++    to: [safeHeader(opts.to)],
++    subject: safeHeader(opts.subject),
++    html: opts.html,
++    text: opts.text,
++  }
++  if (RESEND_REPLY_TO) payload.reply_to = safeHeader(RESEND_REPLY_TO)
++  if (opts.attachments && opts.attachments.length > 0) payload.attachments = opts.attachments
++
++  let res: Response
++  try {
++    res = await fetch('https://api.resend.com/emails', {
++      method: 'POST',
++      headers: {
++        Authorization: `Bearer ${RESEND_API_KEY}`,
++        'Content-Type': 'application/json',
++      },
++      body: JSON.stringify(payload),
++      // Bound the network wait so a stalled Resend API cannot hold an auth
++      // request until the platform kills the function (mirrors the SMTP
++      // timeouts the nodemailer path used).
++      signal: AbortSignal.timeout(15_000),
++    })
++  } catch (err) {
++    logger.error('[resend] network failure:', err instanceof Error ? err.message : String(err))
++    throw new Error('Email delivery network failure.')
++  }
++
++  if (!res.ok) {
++    let detail = ''
++    try {
++      const body = (await res.json()) as { message?: string; name?: string }
++      detail = [body?.name, body?.message].filter(Boolean).join(': ')
++    } catch {
++      detail = (await res.text().catch(() => '')).slice(0, 300)
++    }
++    logger.error(`[resend] delivery failed (${res.status}): ${detail}`)
++    // Surface operator-actionable cases distinctly (they end up in dev.log /
++    // Vercel logs; the end user only ever sees the route's generic message).
++    if (res.status === 401) {
++      throw new Error('Resend API key rejected (401) — check RESEND_API_KEY.')
++    }
++    if (res.status === 403) {
++      // Classic sandbox-mode restriction: sending to a non-account email
++      // before the domain is verified.
++      throw new Error(
++        `Resend refused the send (403): ${detail || 'unverified domain / testing restriction'}. ` +
++        `Verify your domain in Resend → Domains, or send only to the Resend account email while using onboarding@resend.dev.`
++      )
++    }
++    if (res.status === 422) {
++      throw new Error(`Resend rejected the email payload (422): ${detail}`)
++    }
++    if (res.status === 429) {
++      throw new Error('Resend rate limit hit (429) — slow down OTP sends.')
++    }
++    throw new Error(`Resend delivery failed (${res.status}).`)
++  }
++
++  const json = (await res.json().catch(() => null)) as { id?: string } | null
++  if (!json?.id) {
++    logger.error('[resend] 2xx response without an email id — treating as failure.')
++    throw new Error('Resend returned an unexpected response.')
++  }
++  return { id: json.id }
++}
+-- 
+2.47.3
+
